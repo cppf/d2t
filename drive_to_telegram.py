@@ -1,82 +1,45 @@
 #!/usr/bin/env python3
 """
-drive_to_telegram.py
+Drive -> Telegram
 
-Downloads every file from a PUBLIC Google Drive folder, then sends each
-file to a Telegram chat using your own Telegram account (via Telethon).
-
-Why a user account and not a bot: Telegram BOT accounts can only send
-files up to 50 MB. Regular user accounts can send up to 2 GB (4 GB with
-Telegram Premium). Since your files are 1.5-2 GB, a bot cannot do this -
-this script logs in as you instead.
-
------------------------------------------------------------------------
-CONFIG
------------------------------------------------------------------------
-All config comes from environment variables (see .env.example), so this
-script runs the same way locally or inside Docker. Required:
-
-    TELEGRAM_API_ID       from https://my.telegram.org
-    TELEGRAM_API_HASH     from https://my.telegram.org
-    GDRIVE_FOLDER_URL     the public Drive folder to copy from
-
-Optional:
-
-    TELEGRAM_CHAT_ID      required for a normal run; NOT required for
-                           --list-chats, since that's how you find it
-    MAX_UPLOAD_MB         defaults to 2048 (2 GB). Set to 4096 if your
-                           account has Telegram Premium.
-    DOWNLOAD_DIR          defaults to ./drive_downloads
-
-See README.md for full setup steps (getting API credentials, sharing
-the Drive folder publicly, finding your chat ID).
-
------------------------------------------------------------------------
-SECURITY NOTE
------------------------------------------------------------------------
-On first login this script creates a file named
-"drive_to_telegram_session.session". That file lets anyone who has it
-access your Telegram account without your password or 2FA. Keep it
-private - never upload it, commit it to git, or share it. Delete it if
-you want to revoke this script's access (you'll just need to log in
-again next run).
+- Keeps the Telethon login session in persistent /app/data by default.
+- Lists the public Drive folder first, so existing local files are NOT
+  downloaded again.
+- Checks the destination Telegram chat before uploading, so an already
+  uploaded file (same filename + size) is skipped.
+- Resolves TELEGRAM_CHAT_ID as an integer/entity, fixing the
+  "Cannot find any entity corresponding to '-100...'" error.
 """
 
 import os
 import sys
 import argparse
+import json
 from pathlib import Path
 
 
 def _require_env(name):
     value = os.environ.get(name)
-    if not value:
-        return None
-    return value.strip()
+    return value.strip() if value else None
 
 
 def load_config():
-    """Reads config from environment variables. Returns a dict, and a
-    list of any required variables that were missing - the caller
-    decides how strict to be, since --list-chats needs less than a
-    full run does."""
     cfg = {
         "api_id": _require_env("TELEGRAM_API_ID"),
         "api_hash": _require_env("TELEGRAM_API_HASH"),
         "chat_id": _require_env("TELEGRAM_CHAT_ID"),
         "drive_url": _require_env("GDRIVE_FOLDER_URL"),
-        "download_dir": Path(os.environ.get("DOWNLOAD_DIR", "./drive_downloads")),
+        "download_dir": Path(os.environ.get("DOWNLOAD_DIR", "/app/data/drive_downloads")),
+        "session": Path(os.environ.get(
+            "TELEGRAM_SESSION", "/app/data/drive_to_telegram_session"
+        )),
         "max_upload_mb": int(os.environ.get("MAX_UPLOAD_MB", "2048")),
-        # On by default: without a host volume mount, disk space inside
-        # the container is the main constraint (see README), so each
-        # file is deleted right after it sends rather than waiting
-        # until the whole batch finishes. Set to "false" to keep local
-        # copies instead - e.g. if you've set up persistent storage.
         "delete_after_send": os.environ.get("DELETE_AFTER_SEND", "true").strip().lower()
+        not in ("false", "0", "no"),
+        "check_destination": os.environ.get("CHECK_DESTINATION", "true").strip().lower()
         not in ("false", "0", "no"),
     }
 
-    # api_id must be an int for Telethon, not a string.
     if cfg["api_id"] is not None:
         try:
             cfg["api_id"] = int(cfg["api_id"])
@@ -89,13 +52,26 @@ def load_config():
         missing.append("TELEGRAM_API_ID")
     if not cfg["api_hash"]:
         missing.append("TELEGRAM_API_HASH")
-
     return cfg, missing
 
 
+def _drive_file_local_path(download_dir, item):
+    # gdown's skip_download result has path/local_path. Prefer path because
+    # it is the path relative to the Drive folder.
+    rel = getattr(item, "path", None) or getattr(item, "local_path", None)
+    if not rel:
+        raise RuntimeError(f"gdown returned an item without a path: {item!r}")
+    return download_dir / Path(rel)
+
+
 def download_drive_folder(cfg):
-    """Downloads all files from the public Drive folder using gdown.
-    Returns a list of local file paths that were downloaded."""
+    """
+    First asks gdown for the Drive manifest with skip_download=True.
+    This is metadata only: no file bytes are downloaded.
+
+    Then downloads ONLY files that are not already present locally.
+    Existing files are reused.
+    """
     import gdown
 
     if not cfg["drive_url"]:
@@ -103,50 +79,85 @@ def download_drive_folder(cfg):
         sys.exit(1)
 
     cfg["download_dir"].mkdir(parents=True, exist_ok=True)
-    before = set(cfg["download_dir"].rglob("*"))
 
-    print(f"Downloading files from Drive folder:\n  {cfg['drive_url']}")
-    print(f"Saving to: {cfg['download_dir'].resolve()}\n")
+    print(f"Reading Drive folder:\n  {cfg['drive_url']}")
+    print("Checking local files before downloading...\n")
 
     try:
-        gdown.download_folder(
+        remote_items = gdown.download_folder(
             url=cfg["drive_url"],
             output=str(cfg["download_dir"]),
-            quiet=False,
+            quiet=True,
             use_cookies=False,
+            skip_download=True,
         )
     except Exception as e:
-        print(f"\nDownload failed: {e}")
+        print(f"\nCould not read Drive folder: {e}")
         print(
             "\nCommon causes:\n"
             "  - The folder isn't shared as 'Anyone with the link'\n"
-            "  - The URL is for a single file, not a folder "
-            "(use the file's own download flow if so)\n"
-            "  - Google is rate-limiting anonymous downloads - wait a "
-            "bit and retry"
+            "  - The URL is not a Drive folder URL\n"
+            "  - Google is rate-limiting anonymous access"
         )
         sys.exit(1)
 
-    after = set(cfg["download_dir"].rglob("*"))
-    new_files = sorted(p for p in (after - before) if p.is_file())
-
-    if not new_files:
-        # Folder may have been downloaded before; fall back to
-        # everything currently in the directory.
-        new_files = sorted(p for p in cfg["download_dir"].rglob("*") if p.is_file())
-
-    if not new_files:
+    if not remote_items:
         print("No files found in that folder. Nothing to send.")
         sys.exit(0)
 
-    print(f"\nDownloaded {len(new_files)} file(s).")
-    return new_files
+    files = []
+    to_download = []
+
+    for item in remote_items:
+        # Skip folders if gdown ever returns one in the manifest.
+        item_path = getattr(item, "path", "")
+        item_type = getattr(item, "type", "")
+        if item_type == "folder":
+            continue
+
+        local_path = _drive_file_local_path(cfg["download_dir"], item)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if local_path.is_file() and local_path.stat().st_size > 0:
+            print(f"LOCAL EXISTS - {local_path}")
+            files.append(local_path)
+        else:
+            to_download.append((item, local_path))
+
+    print(
+        f"\nDrive files: {len(files) + len(to_download)} | "
+        f"already local: {len(files)} | needs download: {len(to_download)}"
+    )
+
+    for item, local_path in to_download:
+        print(f"\nDownloading: {local_path}")
+        try:
+            # Download directly to the exact destination. resume=True also
+            # lets gdown continue an interrupted partial download.
+            result = gdown.download(
+                id=item.id,
+                output=str(local_path),
+                quiet=False,
+                use_cookies=False,
+                resume=True,
+            )
+            if not result or not local_path.is_file():
+                raise RuntimeError("gdown did not produce the expected local file")
+            files.append(local_path)
+        except Exception as e:
+            print(f"  FAILED download - {e}")
+
+    files = sorted(set(p for p in files if p.is_file()))
+
+    if not files:
+        print("\nNo files are available locally to send.")
+        sys.exit(0)
+
+    print(f"\nReady to process {len(files)} file(s).")
+    return files
 
 
 def _delete_local_file(path):
-    """Best-effort delete with its own error handling, so a permission
-    quirk on cleanup doesn't get confused with an upload failure or
-    crash a run that otherwise succeeded."""
     try:
         path.unlink()
         print(f"  Deleted local copy ({path.name}).")
@@ -154,48 +165,105 @@ def _delete_local_file(path):
         print(f"  Warning: couldn't delete local file {path.name}: {e}")
 
 
-async def send_files_to_telegram(
-    client, chat_id, files, max_upload_bytes, delete_after_send
-):
-    """Sends each file to the given chat, one at a time. Skips (with a
-    clear message) any file over Telegram's size limit instead of
-    letting the upload fail partway through.
+async def resolve_chat(client, chat_id):
+    """
+    Convert '-100123...' to an integer and explicitly resolve the entity.
+    Passing the raw string '-100...' to Telethon can cause:
+      Cannot find any entity corresponding to "-100..."
+    """
+    try:
+        numeric_id = int(str(chat_id).strip())
+    except ValueError:
+        # Also allow a username / @username as a convenience.
+        return await client.get_entity(str(chat_id).strip())
 
-    If delete_after_send is True, each file is removed from local
-    storage right after it's confirmed sent - so at most one file's
-    worth of disk space is used at a time, rather than the whole
-    downloaded batch sitting there until the run finishes. Oversized
-    (skipped) files are deleted too, since keeping them serves no
-    purpose - they were never going to send. Files that FAIL to send
-    are kept regardless of this setting, so a failed upload can be
-    retried without re-downloading from Drive."""
-    sent, skipped, failed = [], [], []
+    try:
+        return await client.get_entity(numeric_id)
+    except ValueError:
+        # If the entity is not in the local entity cache, refresh dialogs.
+        async for dialog in client.iter_dialogs():
+            if dialog.id == numeric_id:
+                return dialog.entity
+        raise RuntimeError(
+            f"Telegram entity {numeric_id} could not be resolved. "
+            "Run --list-chats and make sure the account is a member of the "
+            "target chat/channel."
+        )
+
+
+async def telegram_destination_has_file(client, entity, filename, size):
+    """
+    Search the destination chat for the exact filename and verify the
+    document size. This avoids uploading the same file twice.
+
+    A filename-only match is NOT enough: the same filename can legitimately
+    be used for a different file. We therefore require filename + byte size.
+    """
+    try:
+        async for message in client.iter_messages(entity, search=filename, limit=100):
+            document = getattr(getattr(message, "media", None), "document", None)
+            if not document:
+                continue
+
+            remote_name = None
+            for attr in getattr(document, "attributes", []):
+                # DocumentAttributeFilename has a .file_name attribute.
+                if hasattr(attr, "file_name"):
+                    remote_name = attr.file_name
+                    break
+
+            if remote_name == filename and getattr(document, "size", None) == size:
+                return True
+    except Exception as e:
+        print(f"  Warning: destination duplicate check failed: {e}")
+        print("  Continuing with upload.")
+    return False
+
+
+async def send_files_to_telegram(
+    client, entity, files, max_upload_bytes, delete_after_send, check_destination
+):
+    sent, skipped, failed, duplicates = [], [], [], []
 
     for i, path in enumerate(files, 1):
-        size = path.stat().st_size
-        size_mb = size / (1024 * 1024)
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            print(f"\n[{i}/{len(files)}] {path.name}")
+            print(f"  FAILED - cannot stat local file: {e}")
+            failed.append((path, str(e)))
+            continue
 
+        size_mb = size / (1024 * 1024)
         print(f"\n[{i}/{len(files)}] {path.name} ({size_mb:.1f} MB)")
 
         if size > max_upload_bytes:
             limit_mb = max_upload_bytes / (1024 * 1024)
             print(
                 f"  SKIPPED - {size_mb:.1f} MB exceeds the "
-                f"{limit_mb:.0f} MB limit. This file cannot be sent "
-                f"via Telegram in one piece."
+                f"{limit_mb:.0f} MB limit."
             )
             skipped.append(path)
             if delete_after_send:
                 _delete_local_file(path)
             continue
 
+        if check_destination:
+            print("  Checking destination for duplicate...")
+            if await telegram_destination_has_file(client, entity, path.name, size):
+                print("  SKIPPED - identical file already exists in destination.")
+                duplicates.append(path)
+                if delete_after_send:
+                    _delete_local_file(path)
+                continue
+
         try:
             def progress(current, total):
-                pct = current / total * 100
+                pct = current / total * 100 if total else 0
                 print(f"  Uploading... {pct:.0f}%", end="\r")
 
             await client.send_file(
-                chat_id,
+                entity,
                 str(path),
                 caption=path.name,
                 progress_callback=progress,
@@ -206,39 +274,36 @@ async def send_files_to_telegram(
                 _delete_local_file(path)
         except Exception as e:
             print(f"  FAILED - {e}")
-            print(f"  Keeping local copy so you can retry without re-downloading.")
+            print("  Keeping local copy so you can retry without re-downloading.")
             failed.append((path, str(e)))
 
-    return sent, skipped, failed
+    return sent, skipped, failed, duplicates
 
 
 async def list_chats(client):
-    """Prints the user's chats with their IDs, so they can pick which
-    one to put in TELEGRAM_CHAT_ID."""
     print("\nYour chats (use the ID on the right in TELEGRAM_CHAT_ID):\n")
     async for dialog in client.iter_dialogs():
         kind = "group/channel" if dialog.is_group or dialog.is_channel else "user"
         print(f"  {dialog.id:>15}   [{kind:14}]  {dialog.name}")
-    print(
-        "\nCopy the ID for the chat you want, put it into "
-        "TELEGRAM_CHAT_ID in your .env file, then re-run "
-        "without --list-chats."
-    )
+    print("\nPut the target numeric ID into TELEGRAM_CHAT_ID.")
 
 
 async def main_async(args, cfg):
     from telethon import TelegramClient
 
-    session_name = "drive_to_telegram_session"
-    client = TelegramClient(session_name, cfg["api_id"], cfg["api_hash"])
+    # The parent directory is mounted by docker-compose, so this survives
+    # `docker compose run --rm` and the account is not re-authenticated.
+    cfg["session"].parent.mkdir(parents=True, exist_ok=True)
+
+    client = TelegramClient(
+        str(cfg["session"]),
+        cfg["api_id"],
+        cfg["api_hash"],
+    )
 
     print("Connecting to Telegram...")
-    print(
-        "(First run only: you'll be asked for your phone number, then "
-        "a login code Telegram sends you. After that, the session file "
-        f"'{session_name}.session' keeps you logged in - as long as it "
-        "isn't deleted.)\n"
-    )
+    print("If this is the first run with this persistent data folder, "
+          "Telegram will ask for login once. Later runs reuse the session.\n")
     await client.start()
 
     if args.list_chats:
@@ -248,50 +313,56 @@ async def main_async(args, cfg):
 
     if not cfg["chat_id"]:
         print(
-            "TELEGRAM_CHAT_ID is not set. Run with --list-chats first:\n"
-            "  python3 drive_to_telegram.py --list-chats\n"
-            "then add the ID it prints for your target chat to .env."
+            "TELEGRAM_CHAT_ID is not set. Run with --list-chats first, "
+            "then add the target ID to .env."
         )
         await client.disconnect()
         sys.exit(1)
 
-    files = download_drive_folder(cfg)
+    entity = await resolve_chat(client, cfg["chat_id"])
+    print(f"Telegram destination resolved: {getattr(entity, 'title', None) or getattr(entity, 'username', None) or entity.id}")
 
+    files = download_drive_folder(cfg)
     max_upload_bytes = cfg["max_upload_mb"] * 1024 * 1024
 
-    if cfg["delete_after_send"]:
-        print(
-            f"\nSending {len(files)} file(s) to chat {cfg['chat_id']}... "
-            "(each will be deleted from local storage right after it sends)"
-        )
-    else:
-        print(f"\nSending {len(files)} file(s) to chat {cfg['chat_id']}...")
+    print(
+        f"\nSending {len(files)} file(s)... "
+        f"(destination duplicate check: {'ON' if cfg['check_destination'] else 'OFF'})"
+    )
 
-    sent, skipped, failed = await send_files_to_telegram(
-        client, cfg["chat_id"], files, max_upload_bytes, cfg["delete_after_send"]
+    sent, skipped, failed, duplicates = await send_files_to_telegram(
+        client,
+        entity,
+        files,
+        max_upload_bytes,
+        cfg["delete_after_send"],
+        cfg["check_destination"],
     )
 
     print("\n" + "=" * 50)
     print("DONE")
-    print(f"  Sent:    {len(sent)}")
-    print(f"  Skipped (too large): {len(skipped)}")
-    print(f"  Failed:  {len(failed)}")
+    print(f"  Sent:                  {len(sent)}")
+    print(f"  Already in destination:{len(duplicates)}")
+    print(f"  Skipped (too large):   {len(skipped)}")
+    print(f"  Failed:                {len(failed)}")
+
+    if duplicates:
+        print("\nDestination duplicates:")
+        for p in duplicates:
+            print(f"  - {p.name}")
+
     if skipped:
-        note = " (deleted locally too)" if cfg["delete_after_send"] else ""
-        print(f"\nSkipped files (over {cfg['max_upload_mb']} MB limit){note}:")
+        print("\nSkipped files:")
         for p in skipped:
             print(f"  - {p.name}")
+
     if failed:
-        kept_note = (
-            " Local copies were kept so you can retry without re-downloading."
-            if cfg["delete_after_send"]
-            else ""
-        )
-        print(f"\nFailed files:{kept_note}")
+        print("\nFailed files:")
         for p, err in failed:
             print(f"  - {p.name}: {err}")
-    print("=" * 50)
+        print("\nFailed local files were kept so you can retry without re-downloading.")
 
+    print("=" * 50)
     await client.disconnect()
 
 
@@ -308,16 +379,11 @@ def main():
 
     cfg, missing = load_config()
 
-    # --list-chats only needs Telegram credentials, not the Drive URL
-    # or chat ID - those aren't known yet, that's the point of this flag.
     if missing:
         print("Missing required environment variables:")
         for name in missing:
             print(f"  - {name}")
-        print(
-            "\nSet these in a .env file (see .env.example) or as "
-            "environment variables. See README.md for how to get them."
-        )
+        print("\nSet them in .env.")
         sys.exit(1)
 
     if not args.list_chats and not cfg["drive_url"]:

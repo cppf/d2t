@@ -8,11 +8,7 @@ RUN pip install --no-cache-dir gdown telethon
 
 COPY drive_to_telegram.py .
 
-# No files are copied from a host download/session directory and none
-# are declared as volumes here on purpose - per your setup, the
-# session file and downloaded files live only inside the container
-# and are lost when it's removed. If you'd rather they persist across
-# rebuilds (recommended - see README), mount a volume in
-# docker-compose.yml instead of changing this file.
+# Runtime data is persisted by docker-compose through ./data:/app/data.
+# The image itself contains no Telegram session or downloaded files.
 
 ENTRYPOINT ["python3", "drive_to_telegram.py"]

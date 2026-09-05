@@ -11,3 +11,6 @@ drive_downloads/
 # Python
 __pycache__/
 *.pyc
+
+# Persistent Telegram session and downloaded files
+data/
