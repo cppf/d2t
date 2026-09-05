@@ -1,0 +1,13 @@
+# Secrets - never commit these
+.env
+
+# Telegram login session - grants account access to whoever holds it
+*.session
+*.session-journal
+
+# Downloaded files (large, and not something you version-control)
+drive_downloads/
+
+# Python
+__pycache__/
+*.pyc

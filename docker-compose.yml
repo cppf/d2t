@@ -1,0 +1,15 @@
+services:
+  app:
+    build: .
+    env_file:
+      - .env
+    # Required for the login step: Telethon asks for your phone number
+    # and login code via interactive prompts on first run. Without
+    # stdin_open/tty, those prompts have nowhere to go and the
+    # container can hang. This also means every run - not just the
+    # first - needs `docker compose run` (interactive) rather than
+    # `docker compose up` (detached), since no session persists
+    # between container runs. See README for why, and how to change
+    # that if you'd rather not log in every time.
+    stdin_open: true
+    tty: true
