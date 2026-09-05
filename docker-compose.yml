@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    env_file:
+      - .env
+
+    # Persistent storage:
+    # - Telegram session survives container removal/recreation.
+    # - downloaded files survive a failed run, so they are not downloaded again.
+    volumes:
+      - ./data:/app/data
+
+    environment:
+      DOWNLOAD_DIR: /app/data/drive_downloads
+      TELEGRAM_SESSION: /app/data/drive_to_telegram_session
+
+    stdin_open: true
+    tty: true
