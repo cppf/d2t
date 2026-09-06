@@ -198,3 +198,8 @@ The app processes files in batches. By default it:
 Set `BATCH_SIZE` in `.env` to change the batch size (default `5`).
 
 Note: concurrent Telegram uploads can be subject to Telegram/server bandwidth and rate limits. If you encounter rate-limit errors, reduce `BATCH_SIZE` (for example to `2` or `3`).
+
+
+### Telegram video uploads
+
+Compatible video files are sent as Telegram media instead of generic documents, with streaming support enabled. MP4 files are explicitly sent as `video/mp4`. Playback/streaming still depends on the video codec/container being supported by Telegram.

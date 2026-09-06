@@ -13,6 +13,7 @@ Drive -> Telegram
 
 import os
 import sys
+import asyncio
 import argparse
 import json
 from pathlib import Path
@@ -235,10 +236,25 @@ async def _upload_one(
 
     try:
         print(f"  [{index}/{total}] UPLOADING...")
+        # Send videos through Telegram's media/video path rather than as
+        # generic documents. This allows Telegram to recognize compatible
+        # videos (especially MP4) as streamable media.
+        is_video = path.suffix.lower() in {
+            ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi"
+        }
+        send_kwargs = {
+            "caption": path.name,
+            "force_document": not is_video,
+        }
+        if is_video:
+            send_kwargs["supports_streaming"] = True
+            if path.suffix.lower() == ".mp4":
+                send_kwargs["mime_type"] = "video/mp4"
+
         await client.send_file(
             entity,
             str(path),
-            caption=path.name,
+            **send_kwargs,
         )
         print(f"  [{index}/{total}] SENT - {path.name}")
         if delete_after_send:
@@ -413,7 +429,6 @@ def main():
         print("GDRIVE_FOLDER_URL is not set. Add it to your .env file.")
         sys.exit(1)
 
-    import asyncio
     asyncio.run(main_async(args, cfg))
 
 
