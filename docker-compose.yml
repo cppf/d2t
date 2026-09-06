@@ -12,6 +12,7 @@ services:
 
     environment:
       DOWNLOAD_DIR: /app/data/drive_downloads
+      THUMB_DIR: /app/data/thumbnails
       TELEGRAM_SESSION: /app/data/drive_to_telegram_session
 
     stdin_open: true
